@@ -2033,17 +2033,15 @@ static esp_err_t handle_messages(httpd_req_t* req)
     }
     set_json_no_cache(req);
     std::vector<std::pair<std::string, std::string>> esim_nicknames;
-    if (sent_box) {
-        if (!cell_job_lock()) {
-            httpd_resp_set_status(req, "503 Service Unavailable");
-            return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"eSIM 状态暂不可用\"}");
-        }
-        // 使用 eSIM 管理页已读取的同一份列表，不在短信请求里执行读卡。
-        for (const auto& profile : s_esim_cache.profiles) {
-            esim_nicknames.emplace_back(profile.iccid, profile.nickname);
-        }
-        cell_job_unlock();
+    if (!cell_job_lock()) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"eSIM 状态暂不可用\"}");
     }
+    // 收发记录共用 eSIM 管理页已读取的列表，不在短信请求里执行读卡。
+    for (const auto& profile : s_esim_cache.profiles) {
+        esim_nicknames.emplace_back(profile.iccid, profile.nickname);
+    }
+    cell_job_unlock();
     std::string body = idf_inbox_json(sent_box, limit, esim_nicknames);
     return httpd_resp_send(req, body.c_str(), body.size());
 }

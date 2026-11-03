@@ -458,10 +458,10 @@ static void save_identity_cache(const std::string& imei, const std::string& icci
 
 static void append_urc_text(const std::string& raw, int64_t received_us = 0)
 {
-    // 内部元数据随 URC 一起排队，避免旧短信稍后处理时被误认为探测发送后的新回复。
+    // 到达时间和接收卡随 URC 一起排队，延后处理或切卡不改变短信归属。
     char stamp[48];
     snprintf(stamp, sizeof(stamp), "@RXUS:%lld\n", static_cast<long long>(received_us ? received_us : esp_timer_get_time()));
-    std::string text = std::string(stamp) + raw;
+    std::string text = std::string(stamp) + "@RXSIM:" + idf_modem_get_status().iccid + "\n" + raw;
     if (raw.empty() || !s_urc_mutex) return;
     if (xSemaphoreTake(s_urc_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
     if (text.size() >= URC_BUFFER_MAX) {

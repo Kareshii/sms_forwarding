@@ -29,6 +29,7 @@ static constexpr const char* SMS_NVS_PART = "smsdata";
 static constexpr const char* NS_INBOX = "inbox";
 static constexpr const char* NS_SENT = "sent";
 static constexpr uint8_t BLOB_VERSION = 1;
+static constexpr uint8_t INBOX_BLOB_VERSION = 2;
 static constexpr uint8_t SENT_BLOB_VERSION = 2;
 
 struct InboxSlot : IdfInboxEntry {
@@ -87,14 +88,16 @@ static void persist_inbox_entry(const InboxSlot& e)
 {
     if (!s_nvs_ready) return;
     std::string blob;
-    blob.reserve(16 + e.sender.size() + e.ts.size() + e.text.size());
-    blob_put_u8(blob, BLOB_VERSION);
+    blob.reserve(16 + e.sender.size() + e.ts.size() + e.text.size() + e.simIccid.size() + e.simNickname.size());
+    blob_put_u8(blob, INBOX_BLOB_VERSION);
     blob_put_u8(blob, e.forwarded ? 1 : 0);
     blob_put_u32(blob, e.id);
     blob_put_u32(blob, e.recvEpoch);
     blob_put_str(blob, e.sender, false);
     blob_put_str(blob, e.ts, false);
     blob_put_str(blob, e.text, true);
+    blob_put_str(blob, e.simIccid, false);
+    blob_put_str(blob, e.simNickname, false);
     char key[16];
     inbox_key(key, sizeof(key), e.id);
     if (nvs_set_blob(s_inbox_nvs, key, blob.data(), blob.size()) == ESP_OK) {
@@ -184,7 +187,12 @@ static void load_inbox_from_flash()
         e.ts = r.str(false);
         e.text = r.str(true);
         e.forwarded = forwarded;
-        if (ver != BLOB_VERSION || !r.ok || e.id == 0) return false;
+        // 旧版记录没有接收卡信息，保留为空，不用当前 SIM 补填历史归属。
+        if (ver == INBOX_BLOB_VERSION) {
+            e.simIccid = r.str(false);
+            e.simNickname = r.str(false);
+        }
+        if ((ver != BLOB_VERSION && ver != INBOX_BLOB_VERSION) || !r.ok || e.id == 0) return false;
         items.push_back(std::move(e));
         return true;
     });
@@ -313,7 +321,8 @@ void idf_inbox_init(void)
     }
 }
 
-uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts)
+uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts,
+                       const std::string& sim_iccid, const std::string& sim_nickname)
 {
     ensure_init();
     // 收到短信后入库不能因为网页正在读/flash 正在提交而放弃；SMS 任务本来就是串行处理。
@@ -327,6 +336,8 @@ uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts)
     e.sender = sender ? sender : "";
     e.ts = ts ? ts : "";
     e.text = truncate_body(text);
+    e.simIccid = sim_iccid;
+    e.simNickname = sim_nickname;
     e.forwarded = false;
     e.deleted = false;
 
@@ -388,6 +399,8 @@ bool idf_inbox_get_by_id(uint32_t id, IdfInboxEntry& out)
             out.sender = s_inbox[i].sender;
             out.ts = s_inbox[i].ts;
             out.text = s_inbox[i].text;
+            out.simIccid = s_inbox[i].simIccid;
+            out.simNickname = s_inbox[i].simNickname;
             out.forwarded = s_inbox[i].forwarded;
             ok = true;
             break;
@@ -409,6 +422,8 @@ bool idf_inbox_delete(uint32_t id)
             s_inbox[i].sender.clear();
             s_inbox[i].ts.clear();
             s_inbox[i].text.clear();
+            s_inbox[i].simIccid.clear();
+            s_inbox[i].simNickname.clear();
             erase_inbox_entry(id);  // 同步从 flash 抹掉
             ok = true;
             break;
@@ -509,6 +524,14 @@ std::string idf_inbox_json(bool sent_box, int limit,
             size_t idx = (s_inbox_head + INBOX_MAX - 1 - k) % INBOX_MAX;
             const InboxSlot& e = s_inbox[idx];
             if (e.deleted) continue;
+            // 按接收时保存的 ICCID 关联 eSIM 列表昵称，切卡后仍显示原接收卡。
+            const std::string* nickname = &e.simNickname;
+            for (const auto& profile : esim_nicknames) {
+                if (!e.simIccid.empty() && profile.first == e.simIccid) {
+                    nickname = &profile.second;
+                    break;
+                }
+            }
             if (emitted) out += ",";
             snprintf(buf, sizeof(buf), "{\"id\":%u,\"recv\":%u,",
                      static_cast<unsigned>(e.id), static_cast<unsigned>(e.recvEpoch));
@@ -516,6 +539,8 @@ std::string idf_inbox_json(bool sent_box, int limit,
             json_prop(out, "sender", e.sender); out += ",";
             json_prop(out, "ts", e.ts); out += ",";
             json_prop(out, "text", e.text); out += ",";
+            json_prop(out, "simIccid", e.simIccid); out += ",";
+            json_prop(out, "simNickname", *nickname); out += ",";
             out += "\"fwd\":";
             out += e.forwarded ? "true" : "false";
             out += "}";

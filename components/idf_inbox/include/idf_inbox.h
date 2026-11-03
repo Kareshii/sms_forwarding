@@ -15,6 +15,8 @@ struct IdfInboxEntry {
     std::string sender;
     std::string ts;
     std::string text;
+    std::string simIccid;
+    std::string simNickname;
     bool forwarded = false;
 };
 
@@ -29,7 +31,8 @@ struct IdfSentEntry {
 };
 
 void idf_inbox_init(void);
-uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts);
+uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts,
+                       const std::string& sim_iccid, const std::string& sim_nickname);
 void idf_inbox_mark_forwarded(uint32_t id);
 // 投递最终失败时把条目改回"未转发"，让用户能在收件箱看到并手动重发
 void idf_inbox_set_forwarded(uint32_t id, bool forwarded);

@@ -1668,8 +1668,8 @@
       focused.focus({ preventScroll: true });
       showToast(copied ? '已复制' : '复制失败，请手动复制', copied ? 'ok' : 'err');
     }
-    function sentSimLabel(m) {
-      if (!m.simIccid) return '未记录发送卡';
+    function messageSimLabel(m, sent) {
+      if (!m.simIccid) return sent ? '未记录发送卡' : '未记录接收卡';
       return 'ICCID ' + m.simIccid + (m.simNickname ? ' · ' + m.simNickname : '');
     }
     function loadMessages() {
@@ -1745,11 +1745,9 @@
           if (otp) body = body.replace(otp, '<mark>' + otp + '</mark>');  // otp 为纯数字，先转义再高亮，无注入风险
           b.innerHTML = (sent ? '发送内容：' : '') + body;
           d.appendChild(h);
-          if (sent) {
-            var sim = document.createElement('div'); sim.className = 'msg-sim';
-            sim.textContent = '发送卡：' + sentSimLabel(m);
-            d.appendChild(sim);
-          }
+          var sim = document.createElement('div'); sim.className = 'msg-sim';
+          sim.textContent = (sent ? '发送卡：' : '接收卡：') + messageSimLabel(m, sent);
+          d.appendChild(sim);
           d.appendChild(t); d.appendChild(b); fragment.appendChild(d);
         });
       box.appendChild(fragment);
@@ -2286,7 +2284,7 @@
       var otp = sent ? '' : otpExtract(m.text || '');
       var h = '<div class="dk">' + (sent ? '目标' : '发件人') + '</div>' +
               '<div class="dv">' + htmlEsc(who) + ' <span class="msg-chip" id="drawerCopyWho" style="cursor:pointer;">复制号码</span></div>';
-      if (sent) h += '<div class="dk">发送卡</div><div class="dv">' + htmlEsc(sentSimLabel(m)) + '</div>';
+      h += '<div class="dk">' + (sent ? '发送卡' : '接收卡') + '</div><div class="dv">' + htmlEsc(messageSimLabel(m, sent)) + '</div>';
       h += '<div class="dk">时间</div><div class="dv">' + fmtEpochFull(sent ? m.sent : m.recv) + '</div>';
       h += '<div class="dk">状态</div><div class="dv">' + (sent ? (m.ok ? '发送成功' : '发送失败') : (m.fwd ? '已处理' : '待处理')) + '</div>';
       h += '<div class="dk">正文长度</div><div class="dv">' + String((m.text || '').length) + ' 字符</div>';

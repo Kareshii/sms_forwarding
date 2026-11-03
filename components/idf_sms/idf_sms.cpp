@@ -63,6 +63,7 @@ struct ConcatSlot {
     int total = 0;
     int received = 0;
     std::string sender;
+    std::string simIccid;
     std::string timestamp;
     int64_t lastUs = 0;
     int64_t receivedUs = 0;
@@ -78,6 +79,7 @@ struct OutgoingSmsJob {
 
 struct DecodedSms {
     std::string sender;
+    std::string simIccid;
     std::string text;
     std::string timestamp;
     int concat[3] = {};
@@ -92,7 +94,11 @@ static IdfSmsStatus s_status;
 static IdfSmsReplyCheck s_reply_check;
 static bool s_started = false;
 static PDU s_pdu(4096);
-struct SmsIndex { int index = 0; int64_t receivedUs = 0; };
+struct SmsIndex {
+    int index = 0;
+    int64_t receivedUs = 0;
+    std::string simIccid;
+};
 static std::array<SmsIndex, INDEX_QUEUE_MAX> s_index_queue = {};
 static size_t s_index_count = 0;
 static std::array<OutgoingSmsJob, OUT_SMS_QUEUE_MAX> s_out_queue = {};
@@ -105,7 +111,9 @@ static std::array<ConcatSlot, CONCAT_SLOTS> s_concat = {};
 static std::string s_urc_carry;
 static bool s_wait_pdu = false;
 static int64_t s_urc_received_us = 0;
+static std::string s_urc_sim_iccid;
 static int64_t s_wait_pdu_received_us = 0;
+static std::string s_wait_pdu_sim_iccid;
 static int64_t s_wait_pdu_until_us = 0;   // +CMT 后等 PDU 行的窗口截止(3s，对齐 Arduino)
 static bool s_backfill_pending = false;   // 索引队列溢出/CMGR 失败时，请求一次近期 CMGL 兜底
 static bool s_cnma_error_logged = false;  // 避免异常固件每条直推短信都刷同一条确认失败日志
@@ -361,27 +369,26 @@ static void update_status(bool receive_ready, bool got_sms)
     xSemaphoreGive(s_status_mutex);
 }
 
-static void enqueue_index(int idx, int64_t received_us)
+static void enqueue_index(int idx, int64_t received_us, const std::string& sim_iccid)
 {
     if (idx < 0) {
         s_backfill_pending = true;  // 非法索引：改由近期 CMGL 兜底(对齐 Arduino storedSmsPending)
         return;
     }
     for (size_t i = 0; i < s_index_count; ++i) {
-        if (s_index_queue[i].index == idx) return;
+        if (s_index_queue[i].index == idx && s_index_queue[i].simIccid == sim_iccid) return;
     }
     if (s_index_count < INDEX_QUEUE_MAX) {
-        s_index_queue[s_index_count++] = {idx, received_us};
+        s_index_queue[s_index_count++] = {idx, received_us, sim_iccid};
     } else {
         s_backfill_pending = true;  // 队列满：丢索引但请求 CMGL 兜底，避免最长等 60s
     }
 }
 
-static bool pop_index(int& idx, int64_t& received_us)
+static bool pop_index(SmsIndex& sms)
 {
     if (s_index_count == 0) return false;
-    idx = s_index_queue[0].index;
-    received_us = s_index_queue[0].receivedUs;
+    sms = std::move(s_index_queue[0]);
     for (size_t i = 1; i < s_index_count; ++i) s_index_queue[i - 1] = s_index_queue[i];
     --s_index_count;
     return true;
@@ -438,6 +445,7 @@ static void clear_concat_slot(ConcatSlot& slot)
     slot.total = 0;
     slot.received = 0;
     slot.sender.clear();
+    slot.simIccid.clear();
     slot.timestamp.clear();
     slot.lastUs = 0;
     for (auto& part : slot.parts) {
@@ -463,17 +471,20 @@ static std::string assemble_concat(const ConcatSlot& slot)
     return text;
 }
 
-static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw, int64_t received_us, uint32_t received_epoch, bool require_smsc = false);
+static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw,
+                                const std::string& sim_iccid, int64_t received_us,
+                                uint32_t received_epoch, bool require_smsc = false);
 
 // 已成功合并的长短信登记环：SIM 满时部分分段被拒收，SMSC 会整条重投(同 ref)。
 // 槽位合并完成后迟到的重复分段若不识别，会重新开槽并在超时后拼出一条
-// "[缺失分段]"幽灵消息。按 (ref,发件人,总段数,分段内容哈希) 精确匹配才丢弃，
+// "[缺失分段]"幽灵消息。按 (接收卡,ref,发件人,总段数,分段内容哈希) 精确匹配才丢弃，
 // 避免运营商短期复用 ref 时误杀真实新消息。
 struct ConcatDone {
     bool used = false;
     int ref = 0;
     int total = 0;
     std::string sender;
+    std::string simIccid;
     std::array<uint32_t, CONCAT_PARTS> partHash = {};
     std::array<std::string, CONCAT_PARTS> partTimestamp;
     int64_t doneUs = 0;
@@ -482,13 +493,13 @@ static constexpr int64_t CONCAT_DONE_TTL_US = 10LL * 60 * 1000 * 1000;
 static std::array<ConcatDone, 4> s_concat_done = {};
 static size_t s_concat_done_next = 0;
 
-static bool concat_recently_done(int ref, const std::string& sender, int total,
+static bool concat_recently_done(int ref, const std::string& sender, const std::string& sim_iccid, int total,
                                  int part, const std::string& text, const std::string& timestamp)
 {
     int64_t now = esp_timer_get_time();
     for (const auto& d : s_concat_done) {
         if (!d.used || now - d.doneUs > CONCAT_DONE_TTL_US) continue;
-        if (d.ref == ref && d.total == total && d.sender == sender &&
+        if (d.ref == ref && d.total == total && d.sender == sender && d.simIccid == sim_iccid &&
             d.partHash[part - 1] == hash32(text) && d.partTimestamp[part - 1] == timestamp) {
             return true;
         }
@@ -504,6 +515,7 @@ static void record_concat_done(const ConcatSlot& slot)
     d.ref = slot.ref;
     d.total = slot.total;
     d.sender = slot.sender;
+    d.simIccid = slot.simIccid;
     d.partHash.fill(0);
     for (auto& timestamp : d.partTimestamp) timestamp.clear();
     for (int i = 0; i < slot.total && i < static_cast<int>(CONCAT_PARTS); ++i) {
@@ -515,11 +527,12 @@ static void record_concat_done(const ConcatSlot& slot)
     d.doneUs = esp_timer_get_time();
 }
 
-static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int total)
+static ConcatSlot& find_concat_slot(int ref, const std::string& sender, const std::string& sim_iccid, int total)
 {
     int64_t now = esp_timer_get_time();
     for (auto& slot : s_concat) {
-        if (slot.active && slot.ref == ref && slot.sender == sender && slot.total == total) return slot;
+        if (slot.active && slot.ref == ref && slot.sender == sender &&
+            slot.simIccid == sim_iccid && slot.total == total) return slot;
     }
     for (auto& slot : s_concat) {
         if (!slot.active || now - slot.lastUs > CONCAT_TIMEOUT_US) {
@@ -528,6 +541,7 @@ static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int tota
             slot.ref = ref;
             slot.total = total;
             slot.sender = sender;
+            slot.simIccid = sim_iccid;
             slot.lastUs = now;
             return slot;
         }
@@ -541,7 +555,7 @@ static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int tota
         if (!partial.empty()) {
             idf_logf("长短信槽位耗尽，先合并已收 %d/%d 段再复用槽位",
                      oldest->received, oldest->total);
-            process_sms_content(oldest->sender.c_str(), partial.c_str(), oldest->timestamp.c_str(), -1, 0);
+            process_sms_content(oldest->sender.c_str(), partial.c_str(), oldest->timestamp.c_str(), oldest->simIccid, -1, 0);
         }
     }
     clear_concat_slot(*oldest);
@@ -549,11 +563,14 @@ static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int tota
     oldest->ref = ref;
     oldest->total = total;
     oldest->sender = sender;
+    oldest->simIccid = sim_iccid;
     oldest->lastUs = now;
     return *oldest;
 }
 
-static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw, int64_t received_us, uint32_t received_epoch, bool require_smsc)
+static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw,
+                                const std::string& sim_iccid, int64_t received_us,
+                                uint32_t received_epoch, bool require_smsc)
 {
     std::string sender = sender_raw ? sender_raw : "";
     std::string text = text_raw ? text_raw : "";
@@ -565,9 +582,9 @@ static void process_sms_content(const char* sender_raw, const char* text_raw, co
         return;
     }
 
-    // 去重键用 PDU 原始时间戳(双通道 URC+CMGL 收到的是同一原始值)；
+    // 去重键包含接收卡和 PDU 原始时间戳(双通道 URC+CMGL 收到的是同一原始值)；
     // 展示/转发用本地可读时间，未同步时才退回原始数字串
-    uint32_t hash = hash32(sender + "|" + timestamp + "|" + text);
+    uint32_t hash = hash32(sim_iccid + "|" + sender + "|" + timestamp + "|" + text);
     if (seen_recently(hash)) {
         idf_logf("重复短信 %s 已忽略", sender.c_str());
         return;
@@ -590,7 +607,8 @@ static void process_sms_content(const char* sender_raw, const char* text_raw, co
     std::string display_ts = idf_util_format_epoch_local(static_cast<uint32_t>(time(nullptr)), cfg.tzOffsetMin);
     if (display_ts.empty()) display_ts = timestamp;
 
-    uint32_t id = idf_inbox_add(sender.c_str(), text.c_str(), display_ts.c_str());
+    uint32_t id = idf_inbox_add(sender.c_str(), text.c_str(), display_ts.c_str(),
+                                sim_iccid, idf_config_get_sim_nickname(sim_iccid));
     update_status(true, true);
     // 默认日志展示完整发件人(便于确认是谁)，正文仍不落盘(在收发短信页查看)
     idf_logf("收到短信 id=%u 来自 %s，入队转发中", static_cast<unsigned>(id), sender.c_str());
@@ -611,15 +629,15 @@ static void handle_decoded_pdu(const DecodedSms& sms)
     if (total > 1 && part > 0) {
         if (total > static_cast<int>(CONCAT_PARTS) || part > total) {
             idf_logf("长短信分段参数超限 part=%d total=%d，按单条处理", part, total);
-            process_sms_content(sender, text, ts, -1, 0);
+            process_sms_content(sender, text, ts, sms.simIccid, -1, 0);
             return;
         }
-        if (concat_recently_done(ref, sender ? sender : "", total, part,
+        if (concat_recently_done(ref, sender ? sender : "", sms.simIccid, total, part,
                                  text ? text : "", ts ? ts : "")) {
             idf_logf("长短信分段 ref=%d %d/%d 与近期已合并消息重复，忽略", ref, part, total);
             return;
         }
-        ConcatSlot& slot = find_concat_slot(ref, sender ? sender : "", total);
+        ConcatSlot& slot = find_concat_slot(ref, sender ? sender : "", sms.simIccid, total);
         int idx = part - 1;
         if (slot.parts[idx].valid && slot.parts[idx].text != (text ? text : "")) {
             // 8 位引用号可能被运营商快速复用；同一分段号正文已变化时不能继续混拼旧消息。
@@ -630,6 +648,7 @@ static void handle_decoded_pdu(const DecodedSms& sms)
             slot.ref = ref;
             slot.total = total;
             slot.sender = sender ? sender : "";
+            slot.simIccid = sms.simIccid;
             slot.lastUs = esp_timer_get_time();
         }
         if (!slot.parts[idx].valid) {
@@ -653,16 +672,17 @@ static void handle_decoded_pdu(const DecodedSms& sms)
         if (slot.received >= slot.total) {
             record_concat_done(slot);
             std::string full = assemble_concat(slot);
-            process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str(), slot.receivedUs, slot.receivedEpoch, slot.needsSmsc);
+            process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str(),
+                                slot.simIccid, slot.receivedUs, slot.receivedEpoch, slot.needsSmsc);
             clear_concat_slot(slot);
         }
         return;
     }
 
-    process_sms_content(sender, text, ts, sms.receivedUs, sms.receivedEpoch);
+    process_sms_content(sender, text, ts, sms.simIccid, sms.receivedUs, sms.receivedEpoch);
 }
 
-static bool decode_pdu_line(const std::string& line, int64_t received_us = 0)
+static bool decode_pdu_line(const std::string& line, const std::string& sim_iccid, int64_t received_us = 0)
 {
     if (!is_hex_string(line)) return false;
     if (!s_pdu_mutex) return false;
@@ -681,6 +701,7 @@ static bool decode_pdu_line(const std::string& line, int64_t received_us = 0)
         return false;
     }
     decoded.sender = s_pdu.getSender();
+    decoded.simIccid = sim_iccid;
     decoded.text = s_pdu.getText();
     decoded.timestamp = s_pdu.getTimeStamp();
     decoded.receivedUs = received_us;
@@ -714,7 +735,7 @@ static void expire_concat_slots()
         std::string full = assemble_concat(slot);
         if (!full.empty()) {
             idf_logf("长短信等待超时，已合并现有 %d/%d 段", slot.received, slot.total);
-            process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str(), -1, 0);
+            process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str(), slot.simIccid, -1, 0);
         }
         clear_concat_slot(slot);
     }
@@ -819,6 +840,10 @@ static void process_urc_line(const std::string& raw)
         s_urc_received_us = strtoll(line.c_str() + 6, nullptr, 10);
         return;
     }
+    if (starts_with(line, "@RXSIM:")) {
+        s_urc_sim_iccid = line.substr(7);
+        return;
+    }
 
     // 来电通知：RING/+CLIP 优先处理并返回，独立于短信 PDU 等待逻辑
     if (line == "RING" || starts_with(line, "+CLIP:")) {
@@ -835,14 +860,15 @@ static void process_urc_line(const std::string& raw)
             idf_logf("收到直推短信头，TPDU 长度=%d",
                      comma == std::string::npos ? -1 : atoi(line.c_str() + comma + 1));
             s_wait_pdu_received_us = s_urc_received_us;
+            s_wait_pdu_sim_iccid = s_urc_sim_iccid;
             s_wait_pdu_until_us = esp_timer_get_time() + 3LL * 1000LL * 1000LL;
             return;
         }
         if (starts_with(line, "+CMTI:")) {
-            enqueue_index(parse_cmti_index(line), s_urc_received_us);
+            enqueue_index(parse_cmti_index(line), s_urc_received_us, s_urc_sim_iccid);
             return;
         }
-        if (decode_pdu_line(line, s_wait_pdu_received_us)) {
+        if (decode_pdu_line(line, s_wait_pdu_sim_iccid, s_wait_pdu_received_us)) {
             s_wait_pdu = false;
             // ML307R 的 +CNMI 文档要求直推短信通过 +CNMA 确认，确认后模组才会可靠地
             // 继续上报同一条长短信的后续分段。存储读取(CMGR/CMGL)不走此分支。
@@ -869,9 +895,10 @@ static void process_urc_line(const std::string& raw)
                  comma == std::string::npos ? -1 : atoi(line.c_str() + comma + 1));
         s_wait_pdu = true;
         s_wait_pdu_received_us = s_urc_received_us;
+        s_wait_pdu_sim_iccid = s_urc_sim_iccid;
         s_wait_pdu_until_us = esp_timer_get_time() + 3LL * 1000LL * 1000LL;  // 3s 窗口
     } else if (starts_with(line, "+CMTI:")) {
-        enqueue_index(parse_cmti_index(line), s_urc_received_us);
+        enqueue_index(parse_cmti_index(line), s_urc_received_us, s_urc_sim_iccid);
     }
 }
 
@@ -925,9 +952,13 @@ static bool extract_first_stored_pdu(const std::string& resp, const char* header
     return false;
 }
 
-static void fetch_stored_sms_by_index(int idx, int64_t received_us)
+static void fetch_stored_sms_by_index(int idx, int64_t received_us, const std::string& sim_iccid)
 {
     if (idx < 0) return;
+    if (sim_iccid != idf_modem_get_status().iccid) {
+        idf_logf("暂存短信读取失败(索引=%d)：接收卡已切换，无法读取原卡短信", idx);
+        return;
+    }
     char cmd[24];
     snprintf(cmd, sizeof(cmd), "AT+CMGR=%d", idx);
     std::string resp;
@@ -935,7 +966,7 @@ static void fetch_stored_sms_by_index(int idx, int64_t received_us)
     bool has_header = resp.find("+CMGR:") != std::string::npos;
     std::string pdu_line;
     bool has_pdu_line = extract_first_stored_pdu(resp, "+CMGR:", pdu_line);
-    bool decoded = has_pdu_line && decode_pdu_line(pdu_line, received_us);
+    bool decoded = has_pdu_line && decode_pdu_line(pdu_line, sim_iccid, received_us);
     if (has_header) {
         if (decoded) {
             snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", idx);
@@ -957,6 +988,7 @@ static void fetch_stored_sms_by_index(int idx, int64_t received_us)
 
 static void backfill_stored_sms(bool announce)
 {
+    const std::string sim_iccid = idf_modem_get_status().iccid;
     std::string resp;
     esp_err_t err = idf_modem_send_at("AT+CMGL=4", 4000, resp);
     if (err != ESP_OK && resp.find("+CMGL:") == std::string::npos) {
@@ -1010,7 +1042,7 @@ static void backfill_stored_sms(bool announce)
             }
         }
 
-        bool decoded = has_pdu_line && decode_pdu_line(pdu_line);
+        bool decoded = has_pdu_line && decode_pdu_line(pdu_line, sim_iccid);
         if (decoded) ++processed;
         if (idx >= 0 && decoded) {
             char cmd[24];
@@ -1138,10 +1170,9 @@ static void sms_task(void*)
                 continue;
             }
 
-            int idx = -1;
-            int64_t received_us = 0;
-            if (pop_index(idx, received_us)) {
-                fetch_stored_sms_by_index(idx, received_us);
+            SmsIndex stored;
+            if (pop_index(stored)) {
+                fetch_stored_sms_by_index(stored.index, stored.receivedUs, stored.simIccid);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;
             }
