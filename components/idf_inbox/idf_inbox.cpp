@@ -29,6 +29,7 @@ static constexpr const char* SMS_NVS_PART = "smsdata";
 static constexpr const char* NS_INBOX = "inbox";
 static constexpr const char* NS_SENT = "sent";
 static constexpr uint8_t BLOB_VERSION = 1;
+static constexpr uint8_t SENT_BLOB_VERSION = 2;
 
 struct InboxSlot : IdfInboxEntry {
     bool deleted = false;
@@ -113,13 +114,15 @@ static void persist_sent_entry(const IdfSentEntry& e)
 {
     if (!s_nvs_ready) return;
     std::string blob;
-    blob.reserve(12 + e.target.size() + e.text.size());
-    blob_put_u8(blob, BLOB_VERSION);
+    blob.reserve(16 + e.target.size() + e.text.size() + e.simIccid.size() + e.simNickname.size());
+    blob_put_u8(blob, SENT_BLOB_VERSION);
     blob_put_u8(blob, e.ok ? 1 : 0);
     blob_put_u32(blob, e.id);
     blob_put_u32(blob, e.sentEpoch);
     blob_put_str(blob, e.target, false);
     blob_put_str(blob, e.text, true);
+    blob_put_str(blob, e.simIccid, false);
+    blob_put_str(blob, e.simNickname, false);
     char key[16];
     sent_key(key, sizeof(key), e.id);
     if (nvs_set_blob(s_sent_nvs, key, blob.data(), blob.size()) == ESP_OK) {
@@ -127,12 +130,14 @@ static void persist_sent_entry(const IdfSentEntry& e)
     }
 }
 
-static void erase_sent_entry(uint32_t id)
+static esp_err_t erase_sent_entry(uint32_t id)
 {
-    if (!s_nvs_ready || id == 0) return;
+    if (!s_nvs_ready) return ESP_ERR_INVALID_STATE;
     char key[16];
     sent_key(key, sizeof(key), id);
-    if (nvs_erase_key(s_sent_nvs, key) == ESP_OK) nvs_commit(s_sent_nvs);
+    esp_err_t err = nvs_erase_key(s_sent_nvs, key);
+    if (err != ESP_OK) return err;
+    return nvs_commit(s_sent_nvs);
 }
 
 // 遍历命名空间下所有 blob，逐个 get 出原始字节，回调解析(返回是否有效)。
@@ -213,7 +218,12 @@ static void load_sent_from_flash()
         e.target = r.str(false);
         e.text = r.str(true);
         e.ok = ok;
-        if (ver != BLOB_VERSION || !r.ok || e.id == 0) return false;
+        // 旧版记录没有发送卡信息，保持为空，不能用当前 SIM 补填历史归属。
+        if (ver == SENT_BLOB_VERSION) {
+            e.simIccid = r.str(false);
+            e.simNickname = r.str(false);
+        }
+        if ((ver != BLOB_VERSION && ver != SENT_BLOB_VERSION) || !r.ok || e.id == 0) return false;
         items.push_back(std::move(e));
         return true;
     });
@@ -408,7 +418,8 @@ bool idf_inbox_delete(uint32_t id)
     return ok;
 }
 
-void idf_sent_add(const char* target, const char* text, bool ok)
+void idf_sent_add(const char* target, const char* text, bool ok,
+                  const std::string& sim_iccid, const std::string& sim_nickname)
 {
     ensure_init();
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return;
@@ -419,6 +430,8 @@ void idf_sent_add(const char* target, const char* text, bool ok)
     e.sentEpoch = static_cast<uint32_t>(time(nullptr));
     e.target = target ? target : "";
     e.text = truncate_body(text);
+    e.simIccid = sim_iccid;
+    e.simNickname = sim_nickname;
     e.ok = ok;
 
     s_sent_head = (s_sent_head + 1) % SENT_MAX;
@@ -428,7 +441,24 @@ void idf_sent_add(const char* target, const char* text, bool ok)
     xSemaphoreGive(s_mutex);
 }
 
-std::string idf_inbox_json(bool sent_box, int limit)
+esp_err_t idf_sent_delete(uint32_t id)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    for (size_t i = 0; i < s_sent_filled; ++i) {
+        if (s_sent[i].id == id) {
+            // Flash 删除成功后再清空内存，写入失败时向网页报告错误。
+            err = erase_sent_entry(id);
+            if (err == ESP_OK) s_sent[i] = {};
+            break;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    return err;
+}
+
+std::string idf_inbox_json(bool sent_box, int limit,
+                           const std::vector<std::pair<std::string, std::string>>& esim_nicknames)
 {
     // 单次持锁直接遍历环形缓冲：避免"取数量、再逐条取"期间新短信入库导致的
     // 条目错位/重复，也把 51 次锁往返 + O(n²) 扫描降为一次 O(n)
@@ -450,12 +480,23 @@ std::string idf_inbox_json(bool sent_box, int limit)
             if (limit > 0 && emitted >= static_cast<size_t>(limit)) break;
             size_t idx = (s_sent_head + SENT_MAX - 1 - k) % SENT_MAX;
             const IdfSentEntry& e = s_sent[idx];
+            if (e.id == 0) continue;
+            // 按发送时保存的 ICCID 关联 eSIM 列表昵称，已有历史记录同样适用。
+            const std::string* nickname = &e.simNickname;
+            for (const auto& profile : esim_nicknames) {
+                if (!e.simIccid.empty() && profile.first == e.simIccid) {
+                    nickname = &profile.second;
+                    break;
+                }
+            }
             if (emitted) out += ",";
             snprintf(buf, sizeof(buf), "{\"id\":%u,\"sent\":%u,",
                      static_cast<unsigned>(e.id), static_cast<unsigned>(e.sentEpoch));
             out += buf;
             json_prop(out, "target", e.target); out += ",";
             json_prop(out, "text", e.text); out += ",";
+            json_prop(out, "simIccid", e.simIccid); out += ",";
+            json_prop(out, "simNickname", *nickname); out += ",";
             out += "\"ok\":";
             out += e.ok ? "true" : "false";
             out += "}";

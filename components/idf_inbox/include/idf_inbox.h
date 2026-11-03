@@ -4,6 +4,10 @@
 #include <stdint.h>
 
 #include <string>
+#include <utility>
+#include <vector>
+
+#include "esp_err.h"
 
 struct IdfInboxEntry {
     uint32_t id = 0;
@@ -19,6 +23,8 @@ struct IdfSentEntry {
     uint32_t sentEpoch = 0;
     std::string target;
     std::string text;
+    std::string simIccid;
+    std::string simNickname;
     bool ok = false;
 };
 
@@ -31,6 +37,9 @@ size_t idf_inbox_count(void);
 bool idf_inbox_get_by_id(uint32_t id, IdfInboxEntry& out);
 bool idf_inbox_delete(uint32_t id);
 
-void idf_sent_add(const char* target, const char* text, bool ok);
+void idf_sent_add(const char* target, const char* text, bool ok,
+                  const std::string& sim_iccid, const std::string& sim_nickname);
+esp_err_t idf_sent_delete(uint32_t id);
 
-std::string idf_inbox_json(bool sent_box, int limit);
+std::string idf_inbox_json(bool sent_box, int limit,
+                           const std::vector<std::pair<std::string, std::string>>& esim_nicknames);

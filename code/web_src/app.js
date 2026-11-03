@@ -113,8 +113,9 @@
       for (var i = 0; i < 5; i++) {
         var item = items[i] || {}, idx = String(i);
         html += '<details class="config-item sim-credential" id="simCredential' + idx + '"' + (item.iccid ? '' : ' hidden') + '>';
-        html += '<summary><span class="config-item-index">SIM ' + (i + 1) + '</span><span class="config-item-name" id="simCredentialName' + idx + '">' + htmlEsc(configItemName('sim', item.iccid)) + '</span></summary><div class="config-item-body">';
+        html += '<summary><span class="config-item-index">SIM ' + (i + 1) + '</span><span class="config-item-name" id="simCredentialName' + idx + '">' + htmlEsc(item.nickname || configItemName('sim', item.iccid)) + '</span></summary><div class="config-item-body">';
         html += '<div class="form-group"><label class="form-label" for="simIccid' + idx + '">ICCID</label><input class="form-input" name="sim' + idx + 'Iccid" inputmode="text" id="simIccid' + idx + '" autocapitalize="characters" spellcheck="false" maxlength="22" value="' + htmlEsc(item.iccid || '') + '" oninput="updateConfigItemName(\'sim\',' + i + ',this.value)" placeholder="输入完整 ICCID"></div>';
+        html += '<div class="form-group"><label class="form-label" for="simNickname' + idx + '">昵称</label><input class="form-input" name="sim' + idx + 'Nick" id="simNickname' + idx + '" maxlength="64" value="' + htmlEsc(item.nickname || '') + '" oninput="updateConfigItemName(\'sim\',' + i + ',document.getElementById(\'simIccid' + idx + '\').value)" placeholder="例如：英国保号卡（最多 64 字节）"></div>';
         html += '<div class="sim-credential-grid">';
         html += '<div class="form-group"><label>PIN</label><input class="form-input" type="password" name="sim' + idx + 'Pin" inputmode="numeric" minlength="4" maxlength="8" autocomplete="new-password" placeholder="' + (item.pinSet ? '已保存，留空不修改' : '4–8 位数字') + '"></div>';
         html += '<div class="form-group"><label>PIN 最大失败次数</label><input class="form-input" type="number" name="sim' + idx + 'PinMax" min="1" max="2" value="' + (item.pinMax || 1) + '"></div>';
@@ -122,7 +123,7 @@
         html += '<div class="form-group"><label>PUK 最大失败次数</label><input class="form-input" type="number" name="sim' + idx + 'PukMax" min="1" max="5" value="' + (item.pukMax || 1) + '"></div>';
         html += '</div><p class="form-hint">失败计数：PIN ' + (item.pinFailed || 0) + '/' + (item.pinMax || 1) + '，PUK ' + (item.pukFailed || 0) + '/' + (item.pukMax || 1) + '。修改对应凭据会清零该计数。</p>';
         html += '<div class="btn-row"><label class="schedule-switch"><input type="checkbox" name="sim' + idx + 'ResetPin"> 保存时重置 PIN 计数</label><label class="schedule-switch"><input type="checkbox" name="sim' + idx + 'ResetPuk"> 保存时重置 PUK 计数</label></div>';
-        html += '<div class="config-item-actions"><button type="button" class="btn btn-danger btn-sm" onclick="removeSimCredential(' + i + ')">删除凭据</button></div></div></details>';
+        html += '<div class="config-item-actions"><button type="button" class="btn btn-danger btn-sm" onclick="removeSimCredential(' + i + ')">删除卡片配置</button></div></div></details>';
       }
       var count = items.filter(function(item) { return !!item.iccid; }).length;
       html += configListControls('sim', count);
@@ -134,13 +135,15 @@
       return kind === 'sim' && value.length > 8 ? value.slice(0, 4) + ' ···· ' + value.slice(-4) : value;
     }
     function configListControls(kind, count) {
-      var label = kind === 'sim' ? 'SIM 凭据' : 'WiFi 网络';
+      var label = kind === 'sim' ? 'SIM 卡' : 'WiFi 网络';
       return '<p class="config-empty" id="' + kind + 'ConfigEmpty"' + (count ? ' hidden' : '') + '>尚未添加' + label + '，需要时点击下方添加。</p>' +
         '<button type="button" class="btn btn-secondary btn-add" id="' + kind + 'ConfigAdd" onclick="addConfigItem(\'' + kind + '\')"' + (count >= 5 ? ' disabled' : '') + '>+ 添加 ' + label + ' <span id="' + kind + 'ConfigCount">' + count + ' / 5</span></button>';
     }
     function updateConfigItemName(kind, index, value) {
       var el = document.getElementById((kind === 'sim' ? 'simCredentialName' : 'wifiNetworkName') + index);
-      if (el) el.textContent = configItemName(kind, value);
+      var name = configItemName(kind, value);
+      if (kind === 'sim') name = document.getElementById('simNickname' + index).value || name;
+      if (el) el.textContent = name;
     }
     function refreshConfigList(kind) {
       var prefix = kind === 'sim' ? 'simCredential' : 'wifiNetwork', count = 0;
@@ -181,7 +184,7 @@
       refreshConfigList('sim');
       var btn = document.getElementById('simConfigAdd');
       if (btn) btn.focus();
-      showToast('凭据已移除，保存蜂窝设置后生效', 'info');
+      showToast('SIM 卡配置已移除，保存蜂窝设置后生效', 'info');
     }
     function buildPushChannels(chans) {
       chans = chans || [];
@@ -285,7 +288,7 @@
     function panelHook(name) {
       if (name === 'log') { initLogPanel(); } else { stopLogPoll(); }
       if (name === 'overview') { loadStatus(); loadLatestOtp(); startStatusPoll(); } else { stopStatusPoll(); }
-      if (name === 'inbox') loadMessages();
+      if (name === 'inbox') smsTab(smsBox);
       if (name === 'keepalive' || name === 'settings') kaLoadStatus();
       if (name === 'keepalive') stLoadStatus();
       if (name === 'sim') { wifiPrefill(); esimLoadStatus(); loadStatus(); startStatusPoll(); }
@@ -1534,6 +1537,7 @@
         ovSet('tOp', d.operator || (d.modemInitPhase === 'sampling' ? '读取中' : (d.identityFresh ? '未读到' : (d.modemReady ? '未刷新' : modemPhaseText(d))))); ovSet('tModem', modemPhaseText(d));
         ovSet('tCellIp', d.dataEnabled ? (d.cellIp || '获取中') : '— (未启用)');
         ovSet('tPhone', d.phone || '--'); ovSet('tImei', pendingValue(d.imei, d.identityFresh, d)); ovSet('tIccid', pendingValue(d.iccid, d.identityFresh, d));
+        ovSet('inboxPhone', d.phone || '--');
         ovSet('tImsi', pendingValue(d.imsi, d.identityFresh, d)); ovSet('tApn', apnText(d));
         var simLock = document.getElementById('simLockStatus');
         if (simLock) {
@@ -1646,9 +1650,27 @@
     }
     function htmlEsc(s) { return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
     function copyText(txt, el) {
-      if (!navigator.clipboard) { showToast('当前浏览器不支持复制，请手动复制', 'err'); return; }
-      navigator.clipboard.writeText(txt).then(function(){ showToast('已复制', 'ok'); })
-        .catch(function(){ showToast('复制失败，请手动复制', 'err'); });
+      if (window.isSecureContext) {
+        navigator.clipboard.writeText(txt).then(function(){ showToast('已复制', 'ok'); })
+          .catch(function(){ showToast('复制失败，请手动复制', 'err'); });
+        return;
+      }
+      // http://sms.local 下 Edge 不开放 Clipboard API，使用点击事件内的复制命令。
+      var focused = document.activeElement;
+      var field = document.createElement('textarea');
+      field.value = txt;
+      field.readOnly = true;
+      field.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+      document.body.appendChild(field);
+      field.select();
+      var copied = document.execCommand('copy');
+      field.remove();
+      focused.focus({ preventScroll: true });
+      showToast(copied ? '已复制' : '复制失败，请手动复制', copied ? 'ok' : 'err');
+    }
+    function sentSimLabel(m) {
+      if (!m.simIccid) return '未记录发送卡';
+      return 'ICCID ' + m.simIccid + (m.simNickname ? ' · ' + m.simNickname : '');
     }
     function loadMessages() {
       var box = document.getElementById('inboxList');
@@ -1672,6 +1694,7 @@
         var cnt = document.getElementById(sent ? 'cntSent' : 'cntRecv');
         if (cnt) cnt.textContent = arr.length ? String(arr.length) : '';
         renderMessages();
+        loadStatus();
       }).catch(function(e) {
         if (seq !== messageSeq || !panelActive('inbox') || (e && e.name === 'AbortError')) return;
         if (document.getElementById('inboxList') === box) { box.textContent = ''; showToast('无法获取短信', 'err'); }
@@ -1680,8 +1703,8 @@
     // 仅用缓存过滤+渲染(搜索框输入调用，零网络请求，瞬时响应)
     function renderMessages() {
       var box = document.getElementById('inboxList');
-      if (!box) return;
-      var sent = (window.__msgBox === 'sent');
+      if (!box || window.__msgBox !== smsBox) return;
+      var sent = (smsBox === 'sent');
       var qEl = document.getElementById('smsSearch');
       var q = (qEl && qEl.value || '').trim().toLowerCase();
       var arr = window.__msgFull || [];
@@ -1706,7 +1729,7 @@
           }
           var chip = document.createElement('span'); chip.className = 'msg-chip';
           if (sent) {
-            s.textContent = m.target || '(未知)';
+            s.textContent = '收信人：' + (m.target || '(未知)');
             chip.textContent = m.ok ? '发送成功' : '发送失败'; chip.className += m.ok ? ' ok' : ' bad';
           } else {
             s.textContent = m.sender || '(未知)';
@@ -1720,8 +1743,14 @@
           var b = document.createElement('div'); b.className = 'msg-body clamp';
           var body = htmlEsc(m.text || '');
           if (otp) body = body.replace(otp, '<mark>' + otp + '</mark>');  // otp 为纯数字，先转义再高亮，无注入风险
-          b.innerHTML = body;
-          d.appendChild(h); d.appendChild(t); d.appendChild(b); fragment.appendChild(d);
+          b.innerHTML = (sent ? '发送内容：' : '') + body;
+          d.appendChild(h);
+          if (sent) {
+            var sim = document.createElement('div'); sim.className = 'msg-sim';
+            sim.textContent = '发送卡：' + sentSimLabel(m);
+            d.appendChild(sim);
+          }
+          d.appendChild(t); d.appendChild(b); fragment.appendChild(d);
         });
       box.appendChild(fragment);
     }
@@ -2257,6 +2286,7 @@
       var otp = sent ? '' : otpExtract(m.text || '');
       var h = '<div class="dk">' + (sent ? '目标' : '发件人') + '</div>' +
               '<div class="dv">' + htmlEsc(who) + ' <span class="msg-chip" id="drawerCopyWho" style="cursor:pointer;">复制号码</span></div>';
+      if (sent) h += '<div class="dk">发送卡</div><div class="dv">' + htmlEsc(sentSimLabel(m)) + '</div>';
       h += '<div class="dk">时间</div><div class="dv">' + fmtEpochFull(sent ? m.sent : m.recv) + '</div>';
       h += '<div class="dk">状态</div><div class="dv">' + (sent ? (m.ok ? '发送成功' : '发送失败') : (m.fwd ? '已处理' : '待处理')) + '</div>';
       h += '<div class="dk">正文长度</div><div class="dv">' + String((m.text || '').length) + ' 字符</div>';
@@ -2264,7 +2294,7 @@
       var bh = htmlEsc(m.text || ''); if (otp) bh = bh.replace(otp, '<mark>' + otp + '</mark>');
       h += '<div class="dfull">' + bh + '</div><div class="btn-row">';
       if (!sent) h += '<button class="btn btn-primary btn-sm" onclick="resendMsg(' + id + ')">重发转发</button>';
-      if (!sent) h += '<button class="btn btn-danger btn-sm" onclick="deleteMsg(' + id + ')">删除</button>';
+      h += '<button class="btn btn-danger btn-sm" onclick="deleteMsg(' + id + ',\'' + box + '\')">删除</button>';
       if (sent) h += '<button class="btn btn-primary btn-sm" id="drawerSendAgain">再发一次</button>';
       h += '<button class="btn btn-secondary btn-sm" id="drawerCopyFull">复制全文</button></div><div class="result-box" id="drawerRes"></div>';
       drawerBody.innerHTML = h;
@@ -2300,10 +2330,13 @@
         setResult(r, 'result-box ' + (d.success ? 'result-success' : 'result-error'), d.message);
       }).catch(function(e){ setResult(r, 'result-box result-error', '请求失败: ' + e); });
     }
-    function deleteMsg(id) {
-      if (!confirm('确定删除这条短信？')) return;
-      csrfFetch('/delete?id=' + id, { method: 'POST', cache:'no-store' }).then(jsonOrThrow).then(function(d) {
-        if (d.success) { showToast(d.message || '短信已删除', 'ok'); closeMsgDrawer(); loadMessages(); }
+    function deleteMsg(id, box) {
+      if (!confirm(box === 'sent' ? '确定删除这条已发送短信记录？' : '确定删除这条短信？')) return;
+      csrfFetch('/delete?id=' + id + '&box=' + box, { method: 'POST', cache:'no-store' }).then(jsonOrThrow).then(function(d) {
+        if (d.success) {
+          if (window.__msgBox === box) window.__msgFull = window.__msgFull.filter(function(m){ return m.id !== id; });
+          showToast(d.message || '短信已删除', 'ok'); closeMsgDrawer(); loadMessages();
+        }
         else { var r = document.getElementById('drawerRes'); if (r) { setResult(r, 'result-box result-error', d.message); } }
       }).catch(function(e){ var r = document.getElementById('drawerRes'); if (r) { setResult(r, 'result-box result-error', '请求失败: ' + e); } });
     }

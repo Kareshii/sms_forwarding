@@ -29,12 +29,13 @@
           </div>
         </div>
         <div class="card">
-          <div class="card-header">SIM PIN / PUK</div>
+          <div class="card-header">SIM 卡昵称 / PIN / PUK</div>
           <div class="card-body">
             <div class="result-box" id="simLockStatus" role="status" aria-live="polite">正在读取 SIM 锁定状态…</div>
             <details class="config-disclosure" id="simUnlockDetails">
-              <summary>配置 PIN / PUK 与解锁</summary>
+              <summary>配置 SIM 卡昵称与解锁凭据</summary>
               <div class="config-disclosure-body">
+                <p class="form-hint section-note">按完整 ICCID 绑定实体 SIM 的昵称；eSIM 使用右侧配置列表中的昵称。ICCID 可在系统概览查看；只设置昵称时，PIN / PUK 可留空。</p>
                 <p class="form-hint section-note credential-warning">凭据只用于完全匹配的 ICCID。PIN 可自动尝试；PUK 输错可能永久锁卡，请确认运营商提供的凭据。</p>
                 <div class="sim-credential-list">%SIM_CREDENTIALS%</div>
                 <p class="form-hint section-note">添加或修改凭据后，先保存蜂窝设置，再手动执行 PUK 解锁。</p>

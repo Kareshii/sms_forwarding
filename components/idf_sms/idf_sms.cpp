@@ -1326,6 +1326,8 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
         message = "模组尚未注册网络";
         return ESP_ERR_INVALID_STATE;
     }
+    // 发送前固定卡片归属，失败复位或之后换卡都不改变本条记录的信息。
+    const std::string sim_nickname = idf_config_get_sim_nickname(modem.iccid);
 
     // 单条容量：GSM7 160 septet / UCS2 70 码元；超出则切分长短信。
     // 分段配额扣除 7 字节 UDH(16 位参考号)：GSM7 152 septet / UCS2 66 码元
@@ -1353,7 +1355,7 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
     err = idf_modem_send_at("AT+CMGF=0", 3000, mode_resp);
     if (err != ESP_OK) {
         message = "无法恢复短信 PDU 模式: " + sms_submit_failure_detail(err, mode_resp);
-        idf_sent_add(phone.c_str(), text.c_str(), false);
+        idf_sent_add(phone.c_str(), text.c_str(), false, modem.iccid, sim_nickname);
         idf_logf("发送前短信模式配置失败，触发模组硬重启: %s", message.c_str());
         idf_modem_request_reset(true);
         return err;
@@ -1368,7 +1370,7 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
                              csms ? static_cast<uint8_t>(i + 1) : 0,
                              sms_pdu, pdu_len, message);
         if (err != ESP_OK) {
-            idf_sent_add(phone.c_str(), text.c_str(), false);
+            idf_sent_add(phone.c_str(), text.c_str(), false, modem.iccid, sim_nickname);
             return err;
         }
         char cmd[32];
@@ -1392,7 +1394,7 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
                 idf_log_line("短信提交超时，自动硬重启模组恢复短信通道；本条不自动重发");
                 idf_modem_request_reset(true);
             }
-            idf_sent_add(phone.c_str(), text.c_str(), false);
+            idf_sent_add(phone.c_str(), text.c_str(), false, modem.iccid, sim_nickname);
             idf_logf("网页发送短信失败: %s", message.c_str());
             return err;
         }
@@ -1400,7 +1402,7 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
         if (i + 1 < parts.size()) vTaskDelay(pdMS_TO_TICKS(300));
     }
 
-    idf_sent_add(phone.c_str(), text.c_str(), true);
+    idf_sent_add(phone.c_str(), text.c_str(), true, modem.iccid, sim_nickname);
     if (parts.size() > 1) {
         char buf[64];
         snprintf(buf, sizeof(buf), "长短信发送成功(共 %u 段)", static_cast<unsigned>(parts.size()));

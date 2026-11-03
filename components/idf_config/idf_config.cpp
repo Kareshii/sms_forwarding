@@ -582,6 +582,7 @@ esp_err_t idf_config_load(void)
             char key[20];
             IdfSimCredential& item = next.simCredentials[i];
             snprintf(key, sizeof(key), "sim%dIccid", i); item.iccid = read_iccid(nvs, key);
+            snprintf(key, sizeof(key), "sim%dNick", i); item.nickname = read_str(nvs, key, "", IDF_SIM_NICKNAME_MAX_BYTES);
             snprintf(key, sizeof(key), "sim%dPin", i); item.pin = read_str(nvs, key, "", 8);
             snprintf(key, sizeof(key), "sim%dPuk", i); item.puk = read_str(nvs, key, "", 8);
             snprintf(key, sizeof(key), "sim%dPinMax", i); item.pinMaxAttempts = read_u8(nvs, key, 1);
@@ -741,6 +742,7 @@ std::string idf_config_export_text(bool full_export)
         char key[20];
         const IdfSimCredential& item = c.simCredentials[i];
         snprintf(key, sizeof(key), "sim%dIccid", i); append_kv(out, key, item.iccid);
+        snprintf(key, sizeof(key), "sim%dNick", i); append_kv(out, key, item.nickname);
         snprintf(key, sizeof(key), "sim%dPin", i); append_kv(out, key, full_export ? item.pin : redact_secret(item.pin));
         snprintf(key, sizeof(key), "sim%dPuk", i); append_kv(out, key, full_export ? item.puk : redact_secret(item.puk));
         snprintf(key, sizeof(key), "sim%dPinMax", i); append_kv_i(out, key, item.pinMaxAttempts);
@@ -861,6 +863,7 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
         std::string suffix = key.substr(4);
         IdfSimCredential& item = c.simCredentials[idx];
         if (suffix == "Iccid") item.iccid = value;
+        else if (suffix == "Nick") item.nickname = value;
         else if (suffix == "Pin" && !is_redacted_secret(value)) item.pin = value;
         else if (suffix == "Puk" && !is_redacted_secret(value)) item.puk = value;
         else if (suffix == "PinMax") import_u8_field(item.pinMaxAttempts, value);
@@ -941,6 +944,9 @@ esp_err_t idf_config_import_text(const std::string& text, int* applied_count)
 
     for (const auto& task : next.schedTasks) {
         if (!idf_config_validate_sched_task(task)) return ESP_ERR_INVALID_ARG;
+    }
+    for (const auto& sim : next.simCredentials) {
+        if (sim.nickname.size() > IDF_SIM_NICKNAME_MAX_BYTES) return ESP_ERR_INVALID_ARG;
     }
     next.wifiFromFallback = false;
     esp_err_t err = commit_config_update(next, base);
@@ -1154,6 +1160,7 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
         char key[20];
         const IdfSimCredential& item = c.simCredentials[i];
         snprintf(key, sizeof(key), "sim%dIccid", i); err = write_str(nvs, key, item.iccid);
+        snprintf(key, sizeof(key), "sim%dNick", i); if (err == ESP_OK) err = write_str(nvs, key, item.nickname);
         snprintf(key, sizeof(key), "sim%dPin", i); if (err == ESP_OK) err = write_str(nvs, key, item.pin);
         snprintf(key, sizeof(key), "sim%dPuk", i); if (err == ESP_OK) err = write_str(nvs, key, item.puk);
         snprintf(key, sizeof(key), "sim%dPinMax", i); if (err == ESP_OK) err = nvs_set_u8(nvs, key, item.pinMaxAttempts);
@@ -1814,6 +1821,7 @@ esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std
         }
         next_credentials[i].iccid = idf_normalize_iccid(next_credentials[i].iccid);
         if (next_credentials[i].iccid.empty() ||
+            next_credentials[i].nickname.size() > IDF_SIM_NICKNAME_MAX_BYTES ||
             (!next_credentials[i].pin.empty() && !digits_only(next_credentials[i].pin, 4, 8)) ||
             (!next_credentials[i].puk.empty() && !digits_only(next_credentials[i].puk, 8, 8))) {
             return ESP_ERR_INVALID_ARG;
@@ -1860,6 +1868,7 @@ esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std
         char key[20];
         const IdfSimCredential& item = next_credentials[i];
         snprintf(key, sizeof(key), "sim%dIccid", i); err = write_str(nvs, key, item.iccid);
+        snprintf(key, sizeof(key), "sim%dNick", i); if (err == ESP_OK) err = write_str(nvs, key, item.nickname);
         snprintf(key, sizeof(key), "sim%dPin", i); if (err == ESP_OK) err = write_str(nvs, key, item.pin);
         snprintf(key, sizeof(key), "sim%dPuk", i); if (err == ESP_OK) err = write_str(nvs, key, item.puk);
         snprintf(key, sizeof(key), "sim%dPinMax", i); if (err == ESP_OK) err = nvs_set_u8(nvs, key, item.pinMaxAttempts);
@@ -2005,6 +2014,7 @@ IdfConfigWebView idf_config_get_web_view(void)
     for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
         const IdfSimCredential& item = s_config.simCredentials[i];
         view.simCredentials[i].iccid = item.iccid;
+        view.simCredentials[i].nickname = item.nickname;
         view.simCredentials[i].pinSet = !item.pin.empty();
         view.simCredentials[i].pukSet = !item.puk.empty();
         view.simCredentials[i].pinMaxAttempts = item.pinMaxAttempts;
@@ -2071,6 +2081,20 @@ IdfSimSettingsView idf_config_get_sim_settings_view(void)
     for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) view.credentials[i] = s_config.simCredentials[i];
     xSemaphoreGive(s_config_mutex);
     return view;
+}
+
+std::string idf_config_get_sim_nickname(const std::string& iccid)
+{
+    std::string nickname;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    for (const auto& item : s_config.simCredentials) {
+        if (item.iccid == iccid) {
+            nickname = item.nickname;
+            break;
+        }
+    }
+    xSemaphoreGive(s_config_mutex);
+    return nickname;
 }
 
 IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid)

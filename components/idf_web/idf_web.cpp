@@ -462,13 +462,14 @@ static esp_err_t handle_status(httpd_req_t* req)
 
     snprintf(buf, sizeof(buf),
              "\"dataEnabled\":%s,\"emailEnabled\":%s,\"emailConfigured\":%s,"
-             "\"pushEnabled\":%s,\"pushEnabledCount\":%d,\"apMode\":%s,",
+             "\"pushEnabled\":%s,\"pushEnabledCount\":%d,\"apMode\":%s,\"wifiConnected\":%s,",
              cfg.dataEnabled ? "true" : "false",
              cfg.emailEnabled ? "true" : "false",
              cfg.emailConfigured ? "true" : "false",
              cfg.pushEnabled ? "true" : "false",
              cfg.pushEnabledCount,
-             wifi.apMode ? "true" : "false");
+             wifi.apMode ? "true" : "false",
+             wifi.staConnected ? "true" : "false");
     body += buf;
 
     json_prop(body, "ssid", wifi.staConnected ? wifi.ssid : wifi.apSsid); body += ",";
@@ -577,6 +578,7 @@ static esp_err_t send_config_json(httpd_req_t* req)
         const IdfSimCredentialView& item = cfg.simCredentials[i];
         body += "{";
         json_prop(body, "iccid", item.iccid); body += ",";
+        json_prop(body, "nickname", item.nickname); body += ",";
         snprintf(buf, sizeof(buf),
                  "\"pinSet\":%s,\"pukSet\":%s,\"pinMax\":%u,\"pukMax\":%u,"
                  "\"pinFailed\":%u,\"pukFailed\":%u}",
@@ -1324,6 +1326,7 @@ static void parse_sim_credentials_form(const IdfFormFields& fields,
     for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
         char key[20];
         snprintf(key, sizeof(key), "sim%dIccid", i); items[i].iccid = field_text(fields, key);
+        snprintf(key, sizeof(key), "sim%dNick", i); items[i].nickname = field_text(fields, key);
         snprintf(key, sizeof(key), "sim%dPin", i); items[i].pin = field_text(fields, key);
         snprintf(key, sizeof(key), "sim%dPuk", i); items[i].puk = field_text(fields, key);
         snprintf(key, sizeof(key), "sim%dPinMax", i); items[i].pinMaxAttempts = field_u8(fields, key, 1);
@@ -1558,7 +1561,7 @@ static esp_err_t handle_save(httpd_req_t* req)
                                             credentials);
         if (err == ESP_ERR_INVALID_ARG) {
             set_no_cache_headers(req);
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SIM ICCID/PIN/PUK 格式无效");
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SIM ICCID/PIN/PUK 格式无效，或昵称超过 64 字节");
             return ESP_OK;
         }
         if (err != ESP_OK) return fail(err);
@@ -2029,7 +2032,19 @@ static esp_err_t handle_messages(httpd_req_t* req)
         }
     }
     set_json_no_cache(req);
-    std::string body = idf_inbox_json(sent_box, limit);
+    std::vector<std::pair<std::string, std::string>> esim_nicknames;
+    if (sent_box) {
+        if (!cell_job_lock()) {
+            httpd_resp_set_status(req, "503 Service Unavailable");
+            return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"eSIM 状态暂不可用\"}");
+        }
+        // 使用 eSIM 管理页已读取的同一份列表，不在短信请求里执行读卡。
+        for (const auto& profile : s_esim_cache.profiles) {
+            esim_nicknames.emplace_back(profile.iccid, profile.nickname);
+        }
+        cell_job_unlock();
+    }
+    std::string body = idf_inbox_json(sent_box, limit, esim_nicknames);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
@@ -2150,11 +2165,27 @@ static esp_err_t handle_delete_message(httpd_req_t* req)
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
     uint32_t id = 0;
-    bool ok = query_u32(req, "id", id) && idf_inbox_delete(id);
     set_json_no_cache(req);
-    return httpd_resp_sendstr(req, ok
-        ? "{\"success\":true,\"message\":\"已删除\"}"
-        : "{\"success\":false,\"message\":\"未找到\"}");
+    if (!query_u32(req, "id", id)) {
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"短信 ID 无效\"}");
+    }
+    std::string box;
+    bool has_box = get_query_param(req, "box", box);
+    // 未传 box 的旧请求仍删除收件箱；显式参数只接受收件箱或已发送。
+    if (has_box && box != "recv" && box != "sent") {
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"短信列表无效\"}");
+    }
+    esp_err_t err = box == "sent" ? idf_sent_delete(id)
+        : (idf_inbox_delete(id) ? ESP_OK : ESP_ERR_NOT_FOUND);
+    if (err == ESP_OK) {
+        return httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"已删除\"}");
+    }
+    if (err == ESP_ERR_NOT_FOUND) {
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"未找到\"}");
+    }
+    char body[128];
+    snprintf(body, sizeof(body), "{\"success\":false,\"message\":\"删除失败: %s\"}", esp_err_to_name(err));
+    return httpd_resp_sendstr(req, body);
 }
 
 static esp_err_t handle_resend_message(httpd_req_t* req)

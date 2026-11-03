@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include <string>
@@ -20,9 +21,11 @@ static constexpr int IDF_MAX_SCHED_TASKS = 6;
 // 主备槽位的顺序盲试)。槽位 0 为最近一次配网保存的网络，兼容旧版单组配置。
 static constexpr int IDF_MAX_WIFI_NETWORKS = 5;
 static constexpr int IDF_MAX_SIM_CREDENTIALS = 5;
+static constexpr size_t IDF_SIM_NICKNAME_MAX_BYTES = 64;
 
 struct IdfSimCredential {
     std::string iccid;
+    std::string nickname;
     std::string pin;
     std::string puk;
     uint8_t pinMaxAttempts = 1;
@@ -187,6 +190,7 @@ struct IdfWifiNetworkView {
 
 struct IdfSimCredentialView {
     std::string iccid;
+    std::string nickname;
     bool pinSet = false;
     bool pukSet = false;
     uint8_t pinMaxAttempts = 1;
@@ -327,6 +331,7 @@ IdfConfigWebView idf_config_get_web_view(void);
 IdfKeepaliveRunView idf_config_get_keepalive_run_view(void);
 IdfSchedRunView idf_config_get_sched_run_view(int index);
 IdfSimSettingsView idf_config_get_sim_settings_view(void);
+std::string idf_config_get_sim_nickname(const std::string& iccid);
 IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid);
 IdfSmsProcessView idf_config_get_sms_process_view(void);
 IdfPushForwardView idf_config_get_push_forward_view(void);
